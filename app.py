@@ -1,6 +1,8 @@
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 import json
 import os
+import urllib.parse
+import urllib.request
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 WORDS_FILE = os.path.join(BASE, "data", "words.json")
@@ -27,6 +29,7 @@ HTML = r'''<!doctype html>
     <nav class="nav">
       <button class="btn" onclick="showHome()">홈</button>
       <button class="btn" onclick="showWrong()">오답노트 <span id="wrongBadge"></span></button>
+      <button class="btn" id="langBtn" onclick="toggleLanguage()">🇨🇳 中文</button>
     </nav>
   </header>
   <main id="app"></main>
@@ -35,6 +38,9 @@ HTML = r'''<!doctype html>
 <script>
 const WORDS = __WORDS__;
 const KEY='toeic5_progress_v3';
+const LANG_KEY='toeic5_language_v1';
+let language=localStorage.getItem(LANG_KEY)||'ko';
+let translationCache=JSON.parse(localStorage.getItem('toeic5_zh_cache_v1')||'{}');
 const emptyState=()=>({completed:[],wrong:{},quizzes:0,correct:0,answered:0,level:1});
 let state=load();
 function load(){try{return {...emptyState(),...JSON.parse(localStorage.getItem(KEY)||'{}')}}catch(e){return emptyState()}}
@@ -44,7 +50,21 @@ function groups(){let a=[];for(let i=0;i<WORDS.length;i+=5)a.push(WORDS.slice(i,
 const GS=groups();
 function currentGroup(){for(let i=0;i<GS.length;i++)if(!state.completed.includes(i))return i;return Math.max(0,GS.length-1)}
 function esc(s){return String(s).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
-function layout(html){document.getElementById('app').innerHTML=html;updateBadge();window.scrollTo({top:0,behavior:'smooth'})}
+function layout(html){document.getElementById('app').innerHTML=html;updateBadge();updateLangButton();window.scrollTo({top:0,behavior:'smooth'});if(language==='zh')translateVisibleToChinese()}
+function updateLangButton(){const b=document.getElementById('langBtn');if(b)b.textContent=language==='ko'?'🇨🇳 中文':'🇰🇷 한국어'}
+function toggleLanguage(){language=language==='ko'?'zh':'ko';localStorage.setItem(LANG_KEY,language);updateLangButton();showHome()}
+function hasKorean(s){return /[가-힣]/.test(s)}
+async function translateVisibleToChinese(){
+  const nodes=[]; const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);
+  while(walker.nextNode()){const n=walker.currentNode;const el=n.parentElement;if(el&&(el.tagName==='SCRIPT'||el.tagName==='STYLE'))continue;if(hasKorean(n.nodeValue)&&n.nodeValue.trim())nodes.push(n)}
+  const unique=[...new Set(nodes.map(n=>n.nodeValue.trim()))];
+  const missing=unique.filter(x=>!translationCache[x]);
+  if(missing.length){
+    try{const r=await fetch('/translate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({texts:missing})});const d=await r.json();(d.translations||[]).forEach((v,i)=>{if(v)translationCache[missing[i]]=v});localStorage.setItem('toeic5_zh_cache_v1',JSON.stringify(translationCache))}catch(e){}
+  }
+  nodes.forEach(n=>{const raw=n.nodeValue;const key=raw.trim();if(translationCache[key])n.nodeValue=raw.replace(key,translationCache[key])});
+  updateLangButton();
+}
 function setLevel(n){state.level=n;save();showHome()}
 function home(){
   const g=currentGroup(),done=state.completed.length,pct=Math.round(done/GS.length*100),ws=GS[g];
@@ -156,6 +176,23 @@ showHome();
 @app.get("/")
 def index():
     return render_template_string(HTML.replace("__WORDS__", json.dumps(WORDS, ensure_ascii=False)))
+
+@app.post("/translate")
+def translate():
+    data=request.get_json(silent=True) or {}
+    texts=data.get("texts") or []
+    texts=[str(x)[:500] for x in texts[:40]]
+    out=[]
+    for text in texts:
+        try:
+            q=urllib.parse.quote(text)
+            url=f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=ko&tl=zh-CN&dt=t&q={q}"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                raw=json.loads(resp.read().decode("utf-8"))
+            out.append("".join(part[0] for part in raw[0] if part and part[0]))
+        except Exception:
+            out.append(text)
+    return jsonify(translations=out)
 
 @app.get("/health")
 def health():
