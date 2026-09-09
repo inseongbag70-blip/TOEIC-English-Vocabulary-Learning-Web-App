@@ -3,6 +3,7 @@ import json
 import os
 import urllib.parse
 import urllib.request
+import re
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 WORDS_FILE = os.path.join(BASE, "data", "words.json")
@@ -11,6 +12,37 @@ with open(WORDS_FILE, encoding="utf-8") as f:
     WORDS = json.load(f)
 
 app = Flask(__name__)
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "words": len(WORDS)})
+
+@app.post("/translate")
+def translate():
+    """Translate Korean UI/meanings into Simplified Chinese.
+    Uses Google Translate's public web endpoint server-side so browsers do not need CORS access.
+    """
+    data = request.get_json(silent=True) or {}
+    texts = data.get("texts") or []
+    if not isinstance(texts, list):
+        return jsonify({"translations":[]}), 400
+    out = []
+    for text in texts[:100]:
+        text = str(text)
+        if not text.strip() or not re.search(r"[가-힣]", text):
+            out.append(text)
+            continue
+        try:
+            q = urllib.parse.quote(text)
+            url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=ko&tl=zh-CN&dt=t&q={q}"
+            req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+            translated = "".join(x[0] for x in raw[0] if x and x[0])
+            out.append(translated or text)
+        except Exception:
+            out.append(text)
+    return jsonify({"translations": out})
 
 HTML = r'''<!doctype html>
 <html lang="ko">
