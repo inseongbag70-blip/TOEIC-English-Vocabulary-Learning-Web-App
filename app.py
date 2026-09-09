@@ -60,7 +60,7 @@ function home(){
   <div class="grid" style="margin-top:13px"><div class="card"><div class="num">누적 테스트</div><div class="word">${state.quizzes}회</div></div><div class="card"><div class="num">정답률</div><div class="word">${state.answered?Math.round(state.correct/state.answered*100):0}%</div></div><div class="card"><div class="num">오답 단어</div><div class="word">${Object.keys(state.wrong).length}개</div></div></div>`)
 }
 function showHome(){home()}
-function showLearn(g){const ws=GS[g]||GS[0];layout(`<section class="hero"><h1>${g+1}번째 5단어</h1><p>영어 단어를 먼저 보고 뜻을 떠올린 뒤 확인하세요. 🔊 버튼으로 발음도 듣고, <b>예문 보기</b>에서 짧고 쉬운 문장으로 사용법을 확인하세요.</p></section><div class="grid">${ws.map(w=>`<div class="card"><div class="num">${w.number}</div><div class="word">${esc(w.word)} <button class="speaker" onclick="speak('${esc(w.word).replace(/'/g,"\'")}')" title="발음 듣기">🔊 듣기</button></div><details><summary>뜻 보기</summary><div class="meaning">${esc(w.meaning)}</div></details><details style="margin-top:10px"><summary>💬 예문 보기</summary><div class="meaning"><b>${esc(exampleFor(w))}</b><div style="margin-top:6px;color:#374151">🇰🇷 ${esc(exampleTranslation(w))}</div><div class="small muted" style="margin-top:6px">짧고 쉬운 예문 · 자동 생성</div></div></details></div>`).join('')}</div><div class="actions"><button class="btn" onclick="showHome()">← 홈</button><button class="btn primary" onclick="startQuiz(${g},false)">LEVEL ${state.level} 테스트 시작 →</button></div>`)}
+function showLearn(g){const ws=GS[g]||GS[0];layout(`<section class="hero"><h1>${g+1}번째 5단어</h1><p>영어 단어를 먼저 보고 뜻을 떠올린 뒤 확인하세요. 🔊 버튼으로 발음도 듣고, <b>예문 보기</b>에서 TOEIC 실전형 문장과 전체 한국어 해석을 확인하세요.</p></section><div class="grid">${ws.map(w=>`<div class="card"><div class="num">${w.number}</div><div class="word">${esc(w.word)} <button class="speaker" onclick="speak('${esc(w.word).replace(/'/g,"\'")}')" title="발음 듣기">🔊 듣기</button></div><details><summary>뜻 보기</summary><div class="meaning">${esc(w.meaning)}</div></details><details style="margin-top:10px"><summary>💬 예문 보기</summary><div class="meaning"><b>${esc(exampleFor(w))}</b><div style="margin-top:6px;color:#374151">🇰🇷 ${esc(exampleTranslation(w))}</div><div class="small muted" style="margin-top:6px">TOEIC 실전형 예문 · 전체 문장 해석</div></div></details></div>`).join('')}</div><div class="actions"><button class="btn" onclick="showHome()">← 홈</button><button class="btn primary" onclick="startQuiz(${g},false)">LEVEL ${state.level} 테스트 시작 →</button></div>`)}
 function getPOS(w){const m=String(w.meaning||''); const x=m.match(/\(([^)]*)\)/); return x?x[1].toLowerCase():''}
 function cleanMeaning(w){return String(w.meaning||'').replace(/\([^)]*\)/g,'').split(/[,/;·]|\s+또는\s+|\s+및\s+/)[0].trim()}
 function exampleFor(w){
@@ -99,16 +99,16 @@ function exampleTranslation(w){
   const word=String(w.word); const m=cleanMeaning(w); const pos=getPOS(w);
   const cues=[
     [/예약|예매|reserve/i,'내일 아침 회의실을 예약해 주세요.'],
-    [/수신|인정|감사|acknowledge/i,'금요일까지 이메일 수신을 확인해 주세요.'],
+    [/수신|인정|감사|acknowledge/i,'금요일까지 이메일을 받았다는 사실을 확인해 주세요.'],
     [/재고|inventory/i,'주문하기 전에 재고를 확인해야 합니다.'],
     [/경영진|임원|executive/i,'그 임원은 오늘 오후 회의에 참석할 예정입니다.'],
-    [/특징|특색|특집|feature/i,'새 모델은 더욱 효율적인 디자인을 특징으로 합니다.'],
+    [/특징|특색|특집|feature/i,'새 모델은 더욱 효율적인 디자인을 갖추고 있습니다.'],
     [/상품권|바우처|voucher/i,'고객은 참여 매장에서 이 바우처를 사용할 수 있습니다.'],
-    [/견적|평가|추산|estimate/i,'계약업체는 수리 비용의 견적서를 제공했습니다.'],
+    [/견적|평가|추산|estimate/i,'계약업체는 수리 비용에 대한 견적을 제공했습니다.'],
     [/재개|resume/i,'회의는 잠시 휴식 후 다시 시작될 예정입니다.'],
     [/문제|이슈|발행|issue/i,'회사는 수정된 보고서를 발행할 계획입니다.'],
     [/자격|적격|eligible/i,'자격이 있는 직원만 이 프로그램에 신청할 수 있습니다.'],
-    [/주도권|계획|initiative/i,'회사는 새로운 교육 프로그램을 시작했습니다.'],
+    [/주도권|계획|initiative/i,'회사는 새로운 교육 계획을 시작했습니다.'],
     [/요리|음식|culinary/i,'그 호텔은 훌륭한 요리 프로그램으로 유명합니다.'],
     [/광범위|대규모|extensive/i,'그 프로젝트에는 광범위한 조사와 계획이 필요합니다.'],
     [/예치금|보증금|deposit/i,'예약을 확정하려면 보증금이 필요합니다.'],
@@ -118,14 +118,13 @@ function exampleTranslation(w){
     [/상당히|현저|중요한 정도|significantly/i,'연휴 기간 동안 매출이 크게 증가했습니다.']
   ];
   for(const [re,t] of cues) if(re.test(m)||re.test(word)) return t;
-  if(/동사|verb/.test(pos)) return `관리자는 우리에게 그 요청을 신속하게 ${m}하도록 요청했습니다.`;
-  if(/형용사|adjective/.test(pos)) return `회사는 그 프로젝트를 위해 ${m}한 해결책을 선택했습니다.`;
-  if(/부사|adverb/.test(pos)) return `지난 1년 동안 결과가 ${m}하게 개선되었습니다.`;
-  if(/전치사|preposition/.test(pos)) return `사무실은 정문 ${m}에 있습니다.`;
-  if(/명사|noun/.test(pos)) return `관리자는 회의에서 그 ${m}에 대해 논의했습니다.`;
-  return `회사는 올해 새로운 ${m} 정책을 도입했습니다.`;
+  if(/동사|verb/.test(pos)) return `관리자는 우리에게 그 요청을 신속하게 처리하도록 요청했습니다. (${m})`;
+  if(/형용사|adjective/.test(pos)) return `회사는 그 프로젝트를 위해 적절한 해결책을 선택했습니다. (${m})`;
+  if(/부사|adverb/.test(pos)) return `지난 1년 동안 결과가 크게 개선되었습니다. (${m})`;
+  if(/전치사|preposition/.test(pos)) return `사무실은 정문 근처에 있습니다. (${m})`;
+  if(/명사|noun/.test(pos)) return `관리자는 회의에서 ${m}에 대해 논의했습니다.`;
+  return `회사는 올해 새로운 정책을 도입했습니다. (${m})`;
 }
-function exampleTranslation(w){const word=String(w.word);const meaning=cleanMeaning(w);const pos=getPOS(w);if(/동사|verb/.test(pos))return `이것을 ${meaning}해 주세요.`;if(/형용사|adjective/.test(pos))return `그 방은 ${meaning}합니다.`;if(/부사|adverb/.test(pos))return `그는 ${meaning}하게 말했습니다.`;if(/명사|noun/.test(pos))return `우리는 ${meaning}이 필요합니다.`;return `'${word}'는 ${meaning}라는 뜻입니다.`}
 function speak(word){if('speechSynthesis' in window){window.speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(word);u.lang='en-US';u.rate=.82;window.speechSynthesis.speak(u)}else alert('이 브라우저에서는 음성 재생을 지원하지 않습니다.')}
 function makeOptions(correct){const others=WORDS.filter(x=>x.number!==correct.number);return [correct,...shuffle(others).slice(0,3)].sort(()=>Math.random()-.5)}
 function shuffle(a){return [...a].sort(()=>Math.random()-.5)}
