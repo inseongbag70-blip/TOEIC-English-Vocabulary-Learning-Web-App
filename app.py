@@ -209,27 +209,6 @@ showHome();
 def index():
     return render_template_string(HTML.replace("__WORDS__", json.dumps(WORDS, ensure_ascii=False)))
 
-@app.post("/translate")
-def translate():
-    data=request.get_json(silent=True) or {}
-    texts=data.get("texts") or []
-    texts=[str(x)[:500] for x in texts[:40]]
-    out=[]
-    for text in texts:
-        try:
-            q=urllib.parse.quote(text)
-            url=f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=ko&tl=zh-CN&dt=t&q={q}"
-            with urllib.request.urlopen(url, timeout=5) as resp:
-                raw=json.loads(resp.read().decode("utf-8"))
-            out.append("".join(part[0] for part in raw[0] if part and part[0]))
-        except Exception:
-            out.append(text)
-    return jsonify(translations=out)
-
-@app.get("/health")
-def health():
-    return jsonify(status="ok", words=len(WORDS))
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
