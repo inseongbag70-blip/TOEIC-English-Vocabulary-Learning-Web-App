@@ -1,9 +1,19 @@
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, session
+from werkzeug.security import generate_password_hash, check_password_hash
 import json
 import os
 import urllib.parse
 import urllib.request
 import re
+import secrets
+from datetime import datetime, timezone
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
+    dict_row = None
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 WORDS_FILE = os.path.join(BASE, "data", "words.json")
@@ -12,16 +22,167 @@ with open(WORDS_FILE, encoding="utf-8") as f:
     WORDS = json.load(f)
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
+)
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+def db():
+    if not psycopg:
+        raise RuntimeError("psycopg is not installed. Add psycopg[binary] to requirements.txt.")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL environment variable is not set.")
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+def init_db():
+    if not DATABASE_URL or not psycopg:
+        return
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                username VARCHAR(30) UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_progress (
+                user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                state JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+
+def require_user():
+    uid = session.get("user_id")
+    if not uid:
+        return None
+    return int(uid)
+
+def default_state():
+    return {"completed": [], "wrong": {}, "quizzes": 0, "correct": 0, "answered": 0, "level": 1}
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "words": len(WORDS)})
+    db_ok = False
+    try:
+        if DATABASE_URL:
+            with db() as conn:
+                conn.execute("SELECT 1")
+            db_ok = True
+    except Exception:
+        db_ok = False
+    return jsonify({"status": "ok", "words": len(WORDS), "database": db_ok})
+
+@app.post("/api/register")
+def register():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username", "")).strip()
+    password = str(data.get("password", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_]{3,30}", username):
+        return jsonify({"ok": False, "error": "아이디는 영문, 숫자, 밑줄(_)만 사용하고 3~30자로 입력하세요."}), 400
+    if len(password) < 6 or len(password) > 128:
+        return jsonify({"ok": False, "error": "비밀번호는 6~128자로 입력하세요."}), 400
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT id FROM users WHERE username=%s", (username,)).fetchone()
+            if row:
+                return jsonify({"ok": False, "error": "이미 사용 중인 아이디입니다."}), 409
+            row = conn.execute(
+                "INSERT INTO users (username, password_hash) VALUES (%s,%s) RETURNING id, username",
+                (username, generate_password_hash(password))
+            ).fetchone()
+            conn.execute("INSERT INTO user_progress (user_id, state) VALUES (%s, %s::jsonb)",
+                         (row["id"], json.dumps(default_state(), ensure_ascii=False)))
+            conn.commit()
+            session["user_id"] = row["id"]
+            session["username"] = row["username"]
+            return jsonify({"ok": True, "username": row["username"]})
+    except Exception as e:
+        return jsonify({"ok": False, "error": "회원가입에 실패했습니다. DATABASE_URL 설정을 확인하세요."}), 500
+
+@app.post("/api/login")
+def login():
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username", "")).strip()
+    password = str(data.get("password", ""))
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT id, username, password_hash FROM users WHERE username=%s", (username,)).fetchone()
+        if not row or not check_password_hash(row["password_hash"], password):
+            return jsonify({"ok": False, "error": "아이디 또는 비밀번호가 올바르지 않습니다."}), 401
+        session.clear()
+        session["user_id"] = row["id"]
+        session["username"] = row["username"]
+        return jsonify({"ok": True, "username": row["username"]})
+    except Exception:
+        return jsonify({"ok": False, "error": "로그인에 실패했습니다. DATABASE_URL 설정을 확인하세요."}), 500
+
+@app.post("/api/logout")
+def logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+@app.get("/api/me")
+def me():
+    uid = require_user()
+    if not uid:
+        return jsonify({"logged_in": False})
+    return jsonify({"logged_in": True, "username": session.get("username", "")})
+
+@app.get("/api/state")
+def get_state():
+    uid = require_user()
+    if not uid:
+        return jsonify({"ok": False, "error": "로그인이 필요합니다."}), 401
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT state FROM user_progress WHERE user_id=%s", (uid,)).fetchone()
+            if not row:
+                state = default_state()
+                conn.execute("INSERT INTO user_progress (user_id,state) VALUES (%s,%s::jsonb)",
+                             (uid, json.dumps(state, ensure_ascii=False)))
+                conn.commit()
+            else:
+                state = row["state"]
+        return jsonify({"ok": True, "state": state})
+    except Exception:
+        return jsonify({"ok": False, "error": "학습 데이터를 불러오지 못했습니다."}), 500
+
+@app.put("/api/state")
+def put_state():
+    uid = require_user()
+    if not uid:
+        return jsonify({"ok": False, "error": "로그인이 필요합니다."}), 401
+    state = request.get_json(silent=True) or {}
+    safe = default_state()
+    safe.update(state)
+    # Keep only the fields used by the app.
+    safe["completed"] = [int(x) for x in safe.get("completed", []) if str(x).isdigit()]
+    safe["wrong"] = safe.get("wrong", {}) if isinstance(safe.get("wrong", {}), dict) else {}
+    safe["quizzes"] = max(0, int(safe.get("quizzes", 0)))
+    safe["correct"] = max(0, int(safe.get("correct", 0)))
+    safe["answered"] = max(0, int(safe.get("answered", 0)))
+    safe["level"] = 2 if int(safe.get("level", 1)) == 2 else 1
+    try:
+        with db() as conn:
+            conn.execute("""
+                INSERT INTO user_progress (user_id,state,updated_at) VALUES (%s,%s::jsonb,NOW())
+                ON CONFLICT (user_id) DO UPDATE SET state=EXCLUDED.state, updated_at=NOW()
+            """, (uid, json.dumps(safe, ensure_ascii=False)))
+            conn.commit()
+        return jsonify({"ok": True})
+    except Exception:
+        return jsonify({"ok": False, "error": "학습 데이터 저장에 실패했습니다."}), 500
 
 @app.post("/translate")
-def translate():
-    """Translate Korean UI/meanings into Simplified Chinese.
-    Uses Google Translate's public web endpoint server-side so browsers do not need CORS access.
-    """
+def translate_text():
     data = request.get_json(silent=True) or {}
     texts = data.get("texts") or []
     if not isinstance(texts, list):
@@ -38,8 +199,7 @@ def translate():
             req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=6) as resp:
                 raw = json.loads(resp.read().decode("utf-8"))
-            translated = "".join(x[0] for x in raw[0] if x and x[0])
-            out.append(translated or text)
+            out.append("".join(x[0] for x in raw[0] if x and x[0]) or text)
         except Exception:
             out.append(text)
     return jsonify({"translations": out})
@@ -51,7 +211,7 @@ HTML = r'''<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TOEIC 5단어</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:#f6f7fb;color:#172033;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","Malgun Gothic",sans-serif}.wrap{max-width:980px;margin:auto;padding:18px}.top{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:18px}.brand{font-weight:900;font-size:22px;color:#172033;text-decoration:none}.nav{display:flex;gap:7px;flex-wrap:wrap}.btn{border:1px solid #dfe3ea;background:#fff;border-radius:12px;padding:10px 14px;font-weight:800;cursor:pointer;text-decoration:none;color:#172033}.btn:disabled{opacity:.55;cursor:not-allowed}.primary{background:#2563eb;color:#fff;border-color:#2563eb}.green{background:#059669;color:#fff;border-color:#059669}.red{background:#dc2626;color:#fff;border-color:#dc2626}.dark{background:#111827;color:#fff;border-color:#111827}.hero{background:#111827;color:#fff;border-radius:24px;padding:28px;margin-bottom:16px}.hero h1{margin:0 0 8px;font-size:32px}.hero p{color:#d1d5db;margin:7px 0}.bar{height:10px;background:#374151;border-radius:99px;overflow:hidden;margin:16px 0}.bar>div{height:100%;background:#60a5fa}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:13px}.card{background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:19px;box-shadow:0 3px 12px #00000009}.num{font-size:13px;color:#9aa2b1}.word{font-size:28px;font-weight:900;letter-spacing:-.5px}.meaning{margin-top:8px;color:#4b5563;line-height:1.7}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:16px}.hidden{display:none!important}.muted{color:#6b7280}.quizq{font-size:20px;font-weight:900;margin-bottom:10px}.option{display:block;border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin:8px 0;cursor:pointer}.option:hover{background:#eff6ff;border-color:#93c5fd}.option input{margin-right:8px}.score{font-size:54px;font-weight:950}.notice{padding:12px 14px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:13px;color:#1e3a8a;margin:12px 0}.danger{background:#fef2f2;border-color:#fecaca;color:#991b1b}table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;text-align:left;border-bottom:1px solid #eee}.mode-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:15px 0}.mode{border:2px solid #e5e7eb;background:#fff;border-radius:18px;padding:18px;text-align:left;cursor:pointer}.mode.active{border-color:#2563eb;background:#eff6ff}.mode h3{margin:0 0 5px}.mode p{margin:0;color:#6b7280;line-height:1.5}.type-pill{display:inline-block;padding:5px 9px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px;font-weight:800;margin-bottom:10px}.input-answer{width:100%;font-size:20px;padding:14px;border:2px solid #dfe3ea;border-radius:13px;outline:none}.input-answer:focus{border-color:#2563eb}.small{font-size:13px}.speaker{margin-left:8px;padding:6px 9px;border-radius:10px;border:1px solid #dfe3ea;background:#fff;cursor:pointer}.review-list{display:flex;gap:8px;flex-wrap:wrap}.review-chip{padding:9px 12px;border:1px solid #dfe3ea;background:#fff;border-radius:12px;cursor:pointer;font-weight:700}footer{padding:30px 0;color:#9aa2b1;font-size:13px}@media(max-width:600px){.wrap{padding:12px}.hero h1{font-size:27px}.word{font-size:24px}.mode-grid{grid-template-columns:1fr}}
+*{box-sizing:border-box}body{margin:0;background:#f6f7fb;color:#172033;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","Malgun Gothic",sans-serif}.wrap{max-width:980px;margin:auto;padding:18px}.top{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:18px}.brand{font-weight:900;font-size:22px;color:#172033;text-decoration:none}.nav{display:flex;gap:7px;flex-wrap:wrap}.btn{border:1px solid #dfe3ea;background:#fff;border-radius:12px;padding:10px 14px;font-weight:800;cursor:pointer;text-decoration:none;color:#172033}.btn:disabled{opacity:.55;cursor:not-allowed}.primary{background:#2563eb;color:#fff;border-color:#2563eb}.green{background:#059669;color:#fff;border-color:#059669}.red{background:#dc2626;color:#fff;border-color:#dc2626}.dark{background:#111827;color:#fff;border-color:#111827}.hero{background:#111827;color:#fff;border-radius:24px;padding:28px;margin-bottom:16px}.hero h1{margin:0 0 8px;font-size:32px}.hero p{color:#d1d5db;margin:7px 0}.bar{height:10px;background:#374151;border-radius:99px;overflow:hidden;margin:16px 0}.bar>div{height:100%;background:#60a5fa}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:13px}.card{background:#fff;border:1px solid #e5e7eb;border-radius:18px;padding:19px;box-shadow:0 3px 12px #00000009}.num{font-size:13px;color:#9aa2b1}.word{font-size:28px;font-weight:900;letter-spacing:-.5px}.meaning{margin-top:8px;color:#4b5563;line-height:1.7}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:16px}.hidden{display:none!important}.muted{color:#6b7280}.quizq{font-size:20px;font-weight:900;margin-bottom:10px}.option{display:block;border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin:8px 0;cursor:pointer}.option:hover{background:#eff6ff;border-color:#93c5fd}.option input{margin-right:8px}.score{font-size:54px;font-weight:950}.notice{padding:12px 14px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:13px;color:#1e3a8a;margin:12px 0}.danger{background:#fef2f2;border-color:#fecaca;color:#991b1b}table{width:100%;border-collapse:collapse}th,td{padding:11px 8px;text-align:left;border-bottom:1px solid #eee}.mode-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:15px 0}.mode{border:2px solid #e5e7eb;background:#fff;border-radius:18px;padding:18px;text-align:left;cursor:pointer}.mode.active{border-color:#2563eb;background:#eff6ff}.mode h3{margin:0 0 5px}.mode p{margin:0;color:#6b7280;line-height:1.5}.type-pill{display:inline-block;padding:5px 9px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:12px;font-weight:800;margin-bottom:10px}.input-answer{width:100%;font-size:20px;padding:14px;border:2px solid #dfe3ea;border-radius:13px;outline:none}.input-answer:focus{border-color:#2563eb}.small{font-size:13px}.speaker{margin-left:8px;padding:6px 9px;border-radius:10px;border:1px solid #dfe3ea;background:#fff;cursor:pointer}.review-list{display:flex;gap:8px;flex-wrap:wrap}.review-chip{padding:9px 12px;border:1px solid #dfe3ea;background:#fff;border-radius:12px;cursor:pointer;font-weight:700}.auth{max-width:460px;margin:40px auto}.auth input{width:100%;font-size:17px;padding:13px;border:2px solid #dfe3ea;border-radius:12px;margin:7px 0 12px}.user-pill{padding:9px 12px;background:#eef2ff;border-radius:12px;font-weight:800}footer{padding:30px 0;color:#9aa2b1;font-size:13px}@media(max-width:600px){.wrap{padding:12px}.hero h1{font-size:27px}.word{font-size:24px}.mode-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -61,7 +221,7 @@ HTML = r'''<!doctype html>
     <nav class="nav">
       <button class="btn" onclick="showHome()">홈</button>
       <button class="btn" onclick="showWrong()">오답노트 <span id="wrongBadge"></span></button>
-      <button class="btn" id="langBtn" onclick="toggleLanguage()">🇨🇳 中文</button>
+      <button class="btn" id="langBtn" onclick="toggleLanguage()">🇨🇳 中文</button><span class="user-pill" id="userPill"></span><button class="btn" id="logoutBtn" onclick="logout()">로그아웃</button>
     </nav>
   </header>
   <main id="app"></main>
@@ -69,15 +229,21 @@ HTML = r'''<!doctype html>
 </div>
 <script>
 const WORDS = __WORDS__;
-const KEY='toeic5_progress_v3';
 const LANG_KEY='toeic5_language_v1';
 let language=localStorage.getItem(LANG_KEY)||'ko';
 let translationCache=JSON.parse(localStorage.getItem('toeic5_zh_cache_v1')||'{}');
 const emptyState=()=>({completed:[],wrong:{},quizzes:0,correct:0,answered:0,level:1});
-let state=load();
-function load(){try{return {...emptyState(),...JSON.parse(localStorage.getItem(KEY)||'{}')}}catch(e){return emptyState()}}
-function save(){localStorage.setItem(KEY,JSON.stringify(state));updateBadge()}
-function updateBadge(){const el=document.getElementById('wrongBadge');if(el)el.textContent=Object.keys(state.wrong||{}).length?`(${Object.keys(state.wrong).length})`:''}
+let state=emptyState();
+let currentUser=null;
+let saving=false;
+function updateBadge(){const el=document.getElementById('wrongBadge');if(el)el.textContent=Object.keys(state.wrong||{}).length?`(${Object.keys(state.wrong).length})`:'';const u=document.getElementById('userPill');if(u)u.textContent=currentUser?`👤 ${currentUser}`:''}
+async function save(){
+  updateBadge();
+  try{
+    const r=await fetch('/api/state',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(state)});
+    if(!r.ok) throw new Error('save failed');
+  }catch(e){console.error(e); alert('학습 데이터를 서버에 저장하지 못했습니다. 인터넷 연결을 확인하세요.');}
+}
 function groups(){let a=[];for(let i=0;i<WORDS.length;i+=5)a.push(WORDS.slice(i,i+5));return a}
 const GS=groups();
 function currentGroup(){for(let i=0;i<GS.length;i++)if(!state.completed.includes(i))return i;return Math.max(0,GS.length-1)}
@@ -97,6 +263,43 @@ async function translateVisibleToChinese(){
   nodes.forEach(n=>{const raw=n.nodeValue;const key=raw.trim();if(translationCache[key])n.nodeValue=raw.replace(key,translationCache[key])});
   updateLangButton();
 }
+async function apiJSON(url, options={}){
+  const r=await fetch(url,{headers:{'Content-Type':'application/json',...(options.headers||{})},...options});
+  let d={}; try{d=await r.json()}catch(e){}
+  if(!r.ok) throw new Error(d.error||'요청에 실패했습니다.');
+  return d;
+}
+function showAuth(mode='login'){
+  updateLangButton();
+  document.getElementById('app').innerHTML=`<section class="card auth"><h1>${mode==='login'?'🔐 로그인':'👤 회원가입'}</h1><p class="muted">${mode==='login'?'아이디와 비밀번호로 학습 기록을 불러옵니다.':'새 계정을 만들면 학습 진도가 계정에 저장됩니다.'}</p><label>아이디</label><input id="authUser" autocomplete="username" maxlength="30" placeholder="영문/숫자/_ 3~30자"><label>비밀번호</label><input id="authPass" type="password" autocomplete="${mode==='login'?'current-password':'new-password'}" maxlength="128" placeholder="6자 이상"><div class="actions"><button class="btn primary" onclick="${mode==='login'?'doLogin()':'doRegister()'}">${mode==='login'?'로그인':'회원가입'}</button><button class="btn" onclick="showAuth('${mode==='login'?'register':'login'}')">${mode==='login'?'회원가입':'로그인으로 돌아가기'}</button></div><div id="authMsg" class="notice hidden"></div></section>`;
+  document.getElementById('logoutBtn').classList.add('hidden');
+  document.getElementById('userPill').classList.add('hidden');
+}
+async function doRegister(){
+  const username=document.getElementById('authUser').value.trim(), password=document.getElementById('authPass').value;
+  try{const d=await apiJSON('/api/register',{method:'POST',body:JSON.stringify({username,password})});currentUser=d.username;await loadServerState();showHome();}catch(e){const m=document.getElementById('authMsg');m.textContent=e.message;m.classList.remove('hidden');}
+}
+async function doLogin(){
+  const username=document.getElementById('authUser').value.trim(), password=document.getElementById('authPass').value;
+  try{const d=await apiJSON('/api/login',{method:'POST',body:JSON.stringify({username,password})});currentUser=d.username;await loadServerState();showHome();}catch(e){const m=document.getElementById('authMsg');m.textContent=e.message;m.classList.remove('hidden');}
+}
+async function logout(){
+  if(!confirm('로그아웃할까요?')) return;
+  try{await apiJSON('/api/logout',{method:'POST'});}catch(e){}
+  currentUser=null;state=emptyState();showAuth('login');
+}
+async function loadServerState(){
+  const d=await apiJSON('/api/state');state={...emptyState(),...(d.state||{})};updateBadge();
+}
+async function boot(){
+  try{
+    const me=await apiJSON('/api/me');
+    if(me.logged_in){currentUser=me.username;await loadServerState();showHome();}
+    else showAuth('login');
+  }catch(e){
+    document.getElementById('app').innerHTML='<section class="card auth"><h1>서버 연결 오류</h1><p>로그인 서버에 연결할 수 없습니다. 잠시 후 다시 시도하세요.</p><button class="btn primary" onclick="boot()">다시 시도</button></section>';
+  }
+}
 function setLevel(n){state.level=n;save();showHome()}
 function home(){
   const g=currentGroup(),done=state.completed.length,pct=Math.round(done/GS.length*100),ws=GS[g];
@@ -111,8 +314,8 @@ function home(){
   <section class="card danger" style="margin-top:13px"><h2>학습 데이터</h2><p class="muted">이 브라우저에 저장된 완료 진도, 오답노트, 테스트 기록을 모두 삭제합니다.</p><button class="btn red" onclick="resetProgress()">학습 데이터 초기화</button></section>
   <div class="grid" style="margin-top:13px"><div class="card"><div class="num">누적 테스트</div><div class="word">${state.quizzes}회</div></div><div class="card"><div class="num">정답률</div><div class="word">${state.answered?Math.round(state.correct/state.answered*100):0}%</div></div><div class="card"><div class="num">오답 단어</div><div class="word">${Object.keys(state.wrong).length}개</div></div></div>`)
 }
-function showHome(){home()}
-function showLearn(g){const ws=GS[g]||GS[0];layout(`<section class="hero"><h1>${g+1}번째 5단어</h1><p>영어 단어를 먼저 보고 뜻을 떠올린 뒤 확인하세요. 🔊 버튼으로 발음도 듣고, <b>예문 보기</b>에서 TOEIC 실전형 문장과 전체 한국어 해석을 확인하세요.</p></section><div class="grid">${ws.map(w=>`<div class="card"><div class="num">${w.number}</div><div class="word">${esc(w.word)} <button class="speaker" onclick="speak('${esc(w.word).replace(/'/g,"\'")}')" title="발음 듣기">🔊 듣기</button></div><details><summary>뜻 보기</summary><div class="meaning">${esc(w.meaning)}</div></details><details style="margin-top:10px"><summary>💬 예문 보기</summary><div class="meaning"><b>${esc(exampleFor(w))}</b><div style="margin-top:6px;color:#374151">🇰🇷 ${esc(exampleTranslation(w))}</div><div class="small muted" style="margin-top:6px">TOEIC 실전형 예문 · 전체 문장 해석</div></div></details></div>`).join('')}</div><div class="actions"><button class="btn" onclick="showHome()">← 홈</button><button class="btn primary" onclick="startQuiz(${g},false)">LEVEL ${state.level} 테스트 시작 →</button></div>`)}
+function showHome(){document.getElementById('logoutBtn').classList.remove('hidden');document.getElementById('userPill').classList.remove('hidden');updateBadge();home()}
+function showLearn(g){const ws=GS[g]||GS[0];layout(`<section class="hero"><h1>${g+1}번째 5단어</h1><p>영어 단어를 먼저 보고 뜻을 떠올린 뒤 확인하세요. 🔊 버튼으로 발음도 듣고, <b>예문 보기</b>에서 TOEIC 실전형 문장과 전체 한국어 해석을 확인하세요.</p></section><div class="grid">${ws.map(w=>`<div class="card"><div class="num">${w.number}</div><div class="word">${esc(w.word)} <button class="speaker" onclick="speak('${esc(w.word).replace(/'/g,"\\'")}')" title="발음 듣기">🔊 듣기</button></div><details><summary>뜻 보기</summary><div class="meaning">${esc(w.meaning)}</div></details><details style="margin-top:10px"><summary>💬 예문 보기</summary><div class="meaning"><b>${esc(exampleFor(w))}</b><div style="margin-top:6px;color:#374151">🇰🇷 ${esc(exampleTranslation(w))}</div><div class="small muted" style="margin-top:6px">TOEIC 실전형 예문 · 전체 문장 해석</div></div></details></div>`).join('')}</div><div class="actions"><button class="btn" onclick="showHome()">← 홈</button><button class="btn primary" onclick="startQuiz(${g},false)">LEVEL ${state.level} 테스트 시작 →</button></div>`)}
 function getPOS(w){const m=String(w.meaning||''); const x=m.match(/\(([^)]*)\)/); return x?x[1].toLowerCase():''}
 function cleanMeaning(w){return String(w.meaning||'').replace(/\([^)]*\)/g,'').split(/[,/;·]|\s+또는\s+|\s+및\s+/)[0].trim()}
 function exampleFor(w){
@@ -198,12 +401,20 @@ function showReview(){const vals=[];state.completed.slice().sort((a,b)=>a-b).for
 
 function showWrong(){const vals=Object.values(state.wrong).sort((a,b)=>a.number-b.number);if(!vals.length){layout(`<section class="hero"><h1>오답노트</h1><p>아직 틀린 단어가 없습니다.</p></section><button class="btn primary" onclick="showHome()">학습하러 가기</button>`);return}layout(`<section class="hero"><h1>오답노트</h1><p>총 ${vals.length}개 단어</p></section><section class="card"><table><tr><th>No.</th><th>단어</th><th>뜻</th><th>오답</th></tr>${vals.map(x=>`<tr><td>${x.number}</td><td><b>${esc(x.word)}</b> <button class="speaker" onclick="speak('${esc(x.word).replace(/'/g,"\\'")}')">🔊</button></td><td>${esc(x.meaning)}</td><td>${x.wrong_count}회</td></tr>`).join('')}</table><div class="actions"><button class="btn primary" onclick="showWrongQuiz()">오답만 다시 테스트</button><button class="btn red" onclick="clearWrong()">오답노트 비우기</button></div></section>`)}
 function showWrongQuiz(){const vals=Object.values(state.wrong);if(!vals.length)return showWrong();const ws=shuffle(vals).slice(0,5);if(state.level===2)showLevel2Quiz(ws,true);else{const questions=ws.map(w=>({w,opts:makeOptions(w)}));window.currentQuiz={type:'wrong',questions,review:true};layout(`<section class="hero"><h1>오답 복습 테스트</h1><p>현재 LEVEL ${state.level} 방식으로 출제합니다.</p></section><form onsubmit="submitWrong(event)">${questions.map((q,i)=>`<div class="card" style="margin-bottom:13px"><div class="quizq">${i+1}. ${esc(q.w.word)}</div>${q.opts.map(o=>`<label class="option"><input required type="radio" name="q${i}" value="${o.number}">${esc(o.meaning)}</label>`).join('')}</div>`).join('')}<button class="btn primary">채점하기</button></form>`)}}
-function submitWrong(e){e.preventDefault();const qs=window.currentQuiz.questions;const fd=new FormData(e.target);let score=0,wrong=[];qs.forEach((q,i)=>{const ans=Number(fd.get('q'+i));if(ans===q.w.number)score++;else {wrong.push(q.w);if(state.wrong[String(q.w.number)])state.wrong[String(q.w.number)].wrong_count++}});recordResult(score,qs.length,wrong);showResult(score,qs.length,wrong)}
+function submitWrong(e){e.preventDefault();const qs=window.currentQuiz.questions;const fd=new FormData(e.target);let score=0,wrong=[];qs.forEach((q,i)=>{const ans=Number(fd.get('q'+i));if(ans===q.w.number)score++;else wrong.push(q.w)});recordResult(score,qs.length,wrong);showResult(score,qs.length,wrong)}
 function clearWrong(){if(confirm('오답노트를 모두 삭제할까요?')){state.wrong={};save();showWrong()}}
 function resetProgress(){if(confirm('학습 진도, 오답노트, 테스트 기록을 모두 초기화할까요? 이 작업은 되돌릴 수 없습니다.')){state=emptyState();save();alert('학습 데이터가 초기화되었습니다.');showHome()}}
-showHome();
+boot();
 </script>
 </body></html>'''
+
+
+# Create the tables automatically when DATABASE_URL is configured.
+try:
+    init_db()
+except Exception as e:
+    # Keep the web process alive so /health can report the DB problem.
+    print("Database initialization warning:", e)
 
 @app.get("/")
 def index():
